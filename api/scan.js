@@ -2,12 +2,12 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const cache = globalThis.__blackBoxScanCache || new Map();
 globalThis.__blackBoxScanCache = cache;
 
-// No accounts, API keys, or paid RPC dependencies. Black Box rotates through
-// public Solana mainnet RPC endpoints and fails over automatically.
+// Keyless public Solana RPC endpoints. No paid account or API key required.
+// Order matters: try community public gateways first, official public RPC last.
 const PUBLIC_RPC_POOL = [
-  'https://api.mainnet.solana.com',
-  'https://api.mainnet-beta.solana.com',
-  'https://rpc.ankr.com/solana'
+  'https://solana-rpc.publicnode.com',
+  'https://solana.drpc.org',
+  'https://api.mainnet-beta.solana.com'
 ];
 
 function rpcPool() {
@@ -18,7 +18,7 @@ function rpcPool() {
   return custom.length ? custom : PUBLIC_RPC_POOL;
 }
 
-function timeoutSignal(ms = 9000) {
+function timeoutSignal(ms = 7000) {
   return AbortSignal.timeout(ms);
 }
 
@@ -27,8 +27,7 @@ async function postRpc(endpoint, body) {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'accept': 'application/json',
-      'user-agent': 'CryptoBlackBox/0.1'
+      accept: 'application/json'
     },
     body: JSON.stringify(body),
     signal: timeoutSignal()
@@ -37,60 +36,44 @@ async function postRpc(endpoint, body) {
   if (!response.ok) {
     const error = new Error(`RPC HTTP ${response.status}`);
     error.status = response.status;
-    error.retryAfter = response.headers.get('retry-after');
     throw error;
   }
 
-  return response.json();
-}
-
-async function batchRpc(endpoint, calls) {
-  const body = calls.map((call, index) => ({
-    jsonrpc: '2.0',
-    id: index + 1,
-    method: call.method,
-    params: call.params
-  }));
-
-  const json = await postRpc(endpoint, body);
-  if (!Array.isArray(json)) throw new Error('RPC rejected batch request');
-
-  const byId = new Map(json.map(item => [Number(item.id), item]));
-  return calls.map((_, index) => {
-    const item = byId.get(index + 1);
-    if (!item) throw new Error('RPC omitted a batch response');
-    if (item.error) throw new Error(item.error.message || 'Solana RPC error');
-    return item.result;
-  });
+  const json = await response.json();
+  return json;
 }
 
 async function singleRpc(endpoint, method, params) {
   const json = await postRpc(endpoint, {
-    jsonrpc: '2.0', id: 1, method, params
+    jsonrpc: '2.0',
+    id: 1,
+    method,
+    params
   });
-  if (json.error) throw new Error(json.error.message || 'Solana RPC error');
-  return json.result;
+
+  if (json?.error) throw new Error(json.error.message || 'Solana RPC error');
+  return json?.result;
 }
 
 async function coreScanFromEndpoint(endpoint, mint) {
-  const calls = [
-    { method: 'getAccountInfo', params: [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }] },
-    { method: 'getTokenSupply', params: [mint, { commitment: 'confirmed' }] },
-    { method: 'getTokenLargestAccounts', params: [mint, { commitment: 'confirmed' }] }
-  ];
+  // Use individual calls. Some public gateways reject JSON-RPC batch payloads
+  // even though they support the same methods individually.
+  const account = await singleRpc(endpoint, 'getAccountInfo', [
+    mint,
+    { encoding: 'jsonParsed', commitment: 'confirmed' }
+  ]);
 
-  // Prefer one HTTP request. If an endpoint does not support JSON-RPC batches,
-  // fall back to the three calls sequentially on that same endpoint.
-  try {
-    return await batchRpc(endpoint, calls);
-  } catch (batchError) {
-    if ([403, 429, 500, 502, 503, 504].includes(batchError.status)) throw batchError;
-    const results = [];
-    for (const call of calls) {
-      results.push(await singleRpc(endpoint, call.method, call.params));
-    }
-    return results;
-  }
+  const supply = await singleRpc(endpoint, 'getTokenSupply', [
+    mint,
+    { commitment: 'confirmed' }
+  ]);
+
+  const largest = await singleRpc(endpoint, 'getTokenLargestAccounts', [
+    mint,
+    { commitment: 'confirmed' }
+  ]);
+
+  return [account, supply, largest];
 }
 
 async function scanWithFailover(mint) {
@@ -101,13 +84,15 @@ async function scanWithFailover(mint) {
       const [account, supply, largest] = await coreScanFromEndpoint(endpoint, mint);
       return { endpoint, account, supply, largest, failures };
     } catch (error) {
-      failures.push({ endpoint, error: error.message, status: error.status || null });
-      // 403/429/5xx/timeouts are endpoint-level failures. Immediately try next.
-      continue;
+      failures.push({
+        endpoint,
+        status: error.status || null,
+        error: error.message
+      });
     }
   }
 
-  const error = new Error('All public Solana RPC endpoints are temporarily unavailable');
+  const error = new Error('All configured public Solana RPC endpoints failed');
   error.failures = failures;
   throw error;
 }
@@ -116,6 +101,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', process.env.ALLOWED_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -142,8 +128,7 @@ export default async function handler(req, res) {
     const rows = largest?.value || [];
     let owners = rows.map(() => null);
 
-    // Owner resolution is useful but optional. Never fail the whole scan because
-    // a second RPC request was rate-limited.
+    // Owner lookup is optional; never fail the scan because of this extra request.
     if (rows.length) {
       try {
         const multi = await singleRpc(endpoint, 'getMultipleAccounts', [
@@ -171,10 +156,10 @@ export default async function handler(req, res) {
     res.setHeader('X-Black-Box-Cache', 'MISS');
     return res.status(200).json(data);
   } catch (error) {
-    console.error('scan failed', error, error.failures || []);
+    console.error('scan failed', error.failures || error);
     return res.status(503).json({
-      error: 'Solana public RPC network is temporarily busy',
-      detail: 'Black Box tried every configured public endpoint. Please retry shortly.',
+      error: 'Black Box could not reach Solana right now',
+      detail: 'All configured public RPC endpoints failed. Retry in a moment.',
       attempts: error.failures?.length || rpcPool().length
     });
   }
