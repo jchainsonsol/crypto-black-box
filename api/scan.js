@@ -2,11 +2,10 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const cache = globalThis.__blackBoxScanCache || new Map();
 globalThis.__blackBoxScanCache = cache;
 
-// Keyless public Solana RPC endpoints. No paid account or API key required.
-// Order matters: try community public gateways first, official public RPC last.
 const PUBLIC_RPC_POOL = [
   'https://solana-rpc.publicnode.com',
   'https://solana.drpc.org',
+  'https://api.mainnet.solana.com',
   'https://api.mainnet-beta.solana.com'
 ];
 
@@ -22,14 +21,11 @@ function timeoutSignal(ms = 7000) {
   return AbortSignal.timeout(ms);
 }
 
-async function postRpc(endpoint, body) {
+async function postRpc(endpoint, method, params) {
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json'
-    },
-    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
     signal: timeoutSignal()
   });
 
@@ -40,61 +36,46 @@ async function postRpc(endpoint, body) {
   }
 
   const json = await response.json();
-  return json;
-}
-
-async function singleRpc(endpoint, method, params) {
-  const json = await postRpc(endpoint, {
-    jsonrpc: '2.0',
-    id: 1,
-    method,
-    params
-  });
-
-  if (json?.error) throw new Error(json.error.message || 'Solana RPC error');
+  if (json?.error) {
+    const error = new Error(json.error.message || 'Solana RPC error');
+    error.rpcCode = json.error.code;
+    throw error;
+  }
   return json?.result;
 }
 
-async function coreScanFromEndpoint(endpoint, mint) {
-  // Use individual calls. Some public gateways reject JSON-RPC batch payloads
-  // even though they support the same methods individually.
-  const account = await singleRpc(endpoint, 'getAccountInfo', [
-    mint,
-    { encoding: 'jsonParsed', commitment: 'confirmed' }
-  ]);
-
-  const supply = await singleRpc(endpoint, 'getTokenSupply', [
-    mint,
-    { commitment: 'confirmed' }
-  ]);
-
-  const largest = await singleRpc(endpoint, 'getTokenLargestAccounts', [
-    mint,
-    { commitment: 'confirmed' }
-  ]);
-
-  return [account, supply, largest];
-}
-
-async function scanWithFailover(mint) {
+async function firstWorking(method, params) {
   const failures = [];
-
   for (const endpoint of rpcPool()) {
     try {
-      const [account, supply, largest] = await coreScanFromEndpoint(endpoint, mint);
-      return { endpoint, account, supply, largest, failures };
+      const result = await postRpc(endpoint, method, params);
+      return { endpoint, result, failures };
     } catch (error) {
-      failures.push({
-        endpoint,
-        status: error.status || null,
-        error: error.message
-      });
+      failures.push({ endpoint, status: error.status || null, error: error.message });
+    }
+  }
+  const error = new Error(`All public RPC endpoints failed for ${method}`);
+  error.failures = failures;
+  throw error;
+}
+
+async function optionalLargestAccounts(mint, preferredEndpoint) {
+  const endpoints = [preferredEndpoint, ...rpcPool().filter(x => x !== preferredEndpoint)];
+  const failures = [];
+
+  for (const endpoint of endpoints) {
+    try {
+      const result = await postRpc(endpoint, 'getTokenLargestAccounts', [
+        mint,
+        { commitment: 'confirmed' }
+      ]);
+      return { endpoint, rows: result?.value || [], failures };
+    } catch (error) {
+      failures.push({ endpoint, status: error.status || null, error: error.message });
     }
   }
 
-  const error = new Error('All configured public Solana RPC endpoints failed');
-  error.failures = failures;
-  throw error;
+  return { endpoint: null, rows: [], failures };
 }
 
 export default async function handler(req, res) {
@@ -118,20 +99,31 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { endpoint, account, supply, largest, failures } = await scanWithFailover(mint);
-    const parsed = account?.value?.data?.parsed;
+    // These two calls are the minimum viable chain scan and are broadly supported.
+    const accountRead = await firstWorking('getAccountInfo', [
+      mint,
+      { encoding: 'jsonParsed', commitment: 'confirmed' }
+    ]);
 
+    const parsed = accountRead.result?.value?.data?.parsed;
     if (!parsed || parsed.type !== 'mint') {
       return res.status(400).json({ error: 'Address is not a parsed SPL token mint' });
     }
 
-    const rows = largest?.value || [];
+    const supplyRead = await firstWorking('getTokenSupply', [
+      mint,
+      { commitment: 'confirmed' }
+    ]);
+
+    // Largest-account RPC is commonly disabled or heavily throttled on free public
+    // gateways. Treat it as enrichment, never as a reason to fail the whole scan.
+    const largestRead = await optionalLargestAccounts(mint, accountRead.endpoint);
+    const rows = largestRead.rows;
     let owners = rows.map(() => null);
 
-    // Owner lookup is optional; never fail the scan because of this extra request.
-    if (rows.length) {
+    if (rows.length && largestRead.endpoint) {
       try {
-        const multi = await singleRpc(endpoint, 'getMultipleAccounts', [
+        const multi = await postRpc(largestRead.endpoint, 'getMultipleAccounts', [
           rows.map(x => x.address),
           { encoding: 'jsonParsed', commitment: 'confirmed' }
         ]);
@@ -142,12 +134,16 @@ export default async function handler(req, res) {
     const data = {
       mint,
       mintInfo: parsed.info,
-      programOwner: account.value.owner,
-      supply: supply.value,
+      programOwner: accountRead.result.value.owner,
+      supply: supplyRead.result.value,
       largestAccounts: rows.map((x, i) => ({ ...x, owner: owners[i] || null })),
+      holderAnalysisAvailable: rows.length > 0,
+      holderAnalysisNote: rows.length
+        ? null
+        : 'Largest-account data is unavailable from the current public RPC pool; core mint checks still completed.',
       source: 'public-solana-rpc-failover',
-      rpcEndpoint: new URL(endpoint).hostname,
-      failoversUsed: failures.length,
+      coreRpcEndpoint: new URL(accountRead.endpoint).hostname,
+      holderRpcEndpoint: largestRead.endpoint ? new URL(largestRead.endpoint).hostname : null,
       fetchedAt: new Date().toISOString()
     };
 
@@ -156,10 +152,10 @@ export default async function handler(req, res) {
     res.setHeader('X-Black-Box-Cache', 'MISS');
     return res.status(200).json(data);
   } catch (error) {
-    console.error('scan failed', error.failures || error);
+    console.error('core scan failed', error.failures || error);
     return res.status(503).json({
-      error: 'Black Box could not reach Solana right now',
-      detail: 'All configured public RPC endpoints failed. Retry in a moment.',
+      error: 'Black Box could not reach Solana for the core token scan',
+      detail: 'The public RPC pool could not complete the basic mint read. Retry shortly.',
       attempts: error.failures?.length || rpcPool().length
     });
   }
