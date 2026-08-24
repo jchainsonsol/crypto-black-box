@@ -12,6 +12,7 @@ async function getJson(url, headers = {}) {
 }
 
 function norm(v) { return String(v || '').toLowerCase(); }
+function looksAddress(q) { return /^0x[a-fA-F0-9]{40}$/.test(q) || /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(q); }
 
 function bestPair(pairs, query, preferredChain) {
   const q = norm(query).replace(/^\$/, '');
@@ -27,8 +28,25 @@ function bestPair(pairs, query, preferredChain) {
 }
 
 async function dexScreener(query, preferredChain) {
-  const json = await getJson(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`);
-  return bestPair(json?.pairs || [], query, preferredChain);
+  const failures = [];
+
+  // Contract/mint addresses should use DexScreener's direct token endpoint first.
+  // It is chain-agnostic and materially more reliable than free-text search for fresh tokens.
+  if (looksAddress(query)) {
+    try {
+      const direct = await getJson(`https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(query)}`);
+      const directPair = bestPair(direct?.pairs || [], query, preferredChain);
+      if (directPair) return { pair: directPair, resolver: 'direct-token' };
+    } catch (e) { failures.push(`direct:${e.message}`); }
+  }
+
+  try {
+    const search = await getJson(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`);
+    const searchPair = bestPair(search?.pairs || [], query, preferredChain);
+    if (searchPair) return { pair: searchPair, resolver: 'search' };
+  } catch (e) { failures.push(`search:${e.message}`); }
+
+  return { pair: null, resolver: null, failures };
 }
 
 const GECKO_NETWORK = {
@@ -76,8 +94,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    const pair = await dexScreener(query, preferredChain);
-    if (!pair) return res.status(200).json({ available: false, query, chart: [] });
+    const resolved = await dexScreener(query, preferredChain);
+    const pair = resolved.pair;
+    if (!pair) return res.status(200).json({ available: false, query, chart: [], resolverFailures: resolved.failures || [] });
 
     const token = tokenSide(pair, query);
     const tokenAddress = token?.address || pair.baseToken?.address || query;
@@ -108,12 +127,13 @@ export default async function handler(req, res) {
       pairCreatedAt: pair.pairCreatedAt || null,
       chart,
       chartSource: chart.length ? 'geckoterminal' : 'momentum-fallback',
+      resolver: resolved.resolver,
       source: 'multi-chain-market-enrichment'
     };
     cache.set(key, { timestamp: Date.now(), data });
     res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     return res.status(200).json(data);
   } catch (error) {
-    return res.status(200).json({ available: false, query, chart: [], error: 'Market enrichment temporarily unavailable' });
+    return res.status(200).json({ available: false, query, chart: [], error: 'Market enrichment temporarily unavailable', detail: error.message });
   }
 }
